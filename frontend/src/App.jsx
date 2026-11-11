@@ -2,7 +2,12 @@ import React, { useState } from "react";
 import axios from "axios";
 
 const initialForm = { to: "", subject: "", message: "" };
-const apiUrl = import.meta.env.VITE_API_URL || "http://localhost:3000";
+const apiUrl = (
+  import.meta.env.VITE_API_URL ||
+  (import.meta.env.DEV
+    ? "http://localhost:3000"
+    : "https://ai-email-40a6.onrender.com")
+).replace(/\/+$/, "");
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 function App() {
