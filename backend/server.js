@@ -16,6 +16,17 @@ app.use(
 );
 app.use(express.json({ limit: "100kb" }));
 
+app.get("/", (req, res) => {
+  res.json({
+    success: true,
+    message: "Mail App API is running.",
+    endpoints: {
+      health: "GET /api/health",
+      sendEmail: "POST /api/email/send",
+    },
+  });
+});
+
 app.get("/api/health", (req, res) => {
   const databaseConnected = mongoose.connection.readyState === 1;
   res.status(databaseConnected ? 200 : 503).json({
