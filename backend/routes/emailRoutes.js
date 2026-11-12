@@ -5,8 +5,82 @@ const Email = require("../models/Email");
 
 const router = express.Router();
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const safeDeliveryError =
-  "Email delivery failed. Check the Gmail settings and try again.";
+const connectionErrorCodes = new Set([
+  "ECONNECTION",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EDNS",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ESOCKET",
+  "ETIMEDOUT",
+]);
+
+function getDeliveryFailure(error) {
+  const rawCode =
+    error && typeof error.code === "string" ? error.code : "UNKNOWN";
+  const code = /^[A-Z0-9_]+$/.test(rawCode) ? rawCode : "UNKNOWN";
+  const responseCode =
+    error && Number.isInteger(error.responseCode) ? error.responseCode : null;
+
+  if (code === "EMAIL_CONFIG_MISSING") {
+    return {
+      status: 503,
+      code,
+      responseCode,
+      message:
+        "Gmail SMTP is not configured. Set GMAIL_USER and GMAIL_APP_PASSWORD in the backend environment.",
+    };
+  }
+
+  if (code === "EAUTH" || responseCode === 534 || responseCode === 535) {
+    return {
+      status: 502,
+      code,
+      responseCode,
+      message:
+        "Gmail authentication failed. Check that GMAIL_USER is the full Gmail address and GMAIL_APP_PASSWORD is a valid App Password for an account with 2-Step Verification enabled.",
+    };
+  }
+
+  if (connectionErrorCodes.has(code)) {
+    return {
+      status: 502,
+      code,
+      responseCode,
+      message:
+        "The backend could not connect to Gmail SMTP. Check the backend's outbound connection to Gmail on port 465 or 587.",
+    };
+  }
+
+  if (code === "EENVELOPE" || [550, 553, 554].includes(responseCode)) {
+    return {
+      status: 502,
+      code,
+      responseCode,
+      message:
+        "Gmail rejected the recipient or message. Check the recipient address and the Gmail account's sending limits or policies.",
+    };
+  }
+
+  if (responseCode >= 400 && responseCode < 500) {
+    return {
+      status: 502,
+      code,
+      responseCode,
+      message:
+        "Gmail temporarily rejected the email. Wait a moment and try again; check the backend logs if it continues.",
+    };
+  }
+
+  return {
+    status: 502,
+    code,
+    responseCode,
+    message:
+      "Gmail email delivery failed. Check the backend logs for the SMTP diagnostic code.",
+  };
+}
 
 router.post("/send", async (req, res, next) => {
   const { to, subject, message } = req.body || {};
@@ -34,6 +108,7 @@ router.post("/send", async (req, res, next) => {
   }
 
   let savedEmail;
+  let transporter;
 
   try {
     savedEmail = await Email.create({
@@ -46,21 +121,31 @@ router.post("/send", async (req, res, next) => {
   }
 
   try {
-    const user = process.env.GMAIL_USER;
-    const pass = process.env.GMAIL_APP_PASSWORD;
+    const user = (process.env.GMAIL_USER || "").trim();
+    const pass = (process.env.GMAIL_APP_PASSWORD || "").replace(/\s+/g, "");
+    const missingVariables = [];
 
-    if (
-      !user ||
-      user === "YOUR_GMAIL_ADDRESS" ||
-      !pass ||
-      pass === "YOUR_GMAIL_APP_PASSWORD"
-    ) {
-      throw new Error("Gmail credentials are not configured.");
+    if (!user || user === "YOUR_GMAIL_ADDRESS") {
+      missingVariables.push("GMAIL_USER");
+    }
+    if (!pass || pass === "YOUR_GMAIL_APP_PASSWORD") {
+      missingVariables.push("GMAIL_APP_PASSWORD");
+    }
+    if (missingVariables.length) {
+      const error = new Error("Gmail SMTP configuration is incomplete.");
+      error.code = "EMAIL_CONFIG_MISSING";
+      error.missingVariables = missingVariables;
+      throw error;
     }
 
-    const transporter = nodemailer.createTransport({
+    transporter = nodemailer.createTransport({
       service: "gmail",
       auth: { user, pass },
+    });
+
+    await transporter.verify();
+    console.info("Gmail SMTP verification succeeded.", {
+      emailId: savedEmail.id,
     });
 
     await transporter.sendMail({
@@ -73,6 +158,7 @@ router.post("/send", async (req, res, next) => {
     savedEmail.status = "sent";
     savedEmail.error = undefined;
     await savedEmail.save();
+    console.info("Email sent successfully.", { emailId: savedEmail.id });
 
     return res.status(201).json({
       success: true,
@@ -86,20 +172,39 @@ router.post("/send", async (req, res, next) => {
       },
     });
   } catch (error) {
+    const failure = getDeliveryFailure(error);
+
+    console.error("Email delivery failed.", {
+      emailId: savedEmail.id,
+      code: failure.code,
+      responseCode: failure.responseCode,
+      missingVariables:
+        error && Array.isArray(error.missingVariables)
+          ? error.missingVariables
+          : undefined,
+    });
+
     try {
       savedEmail.status = "failed";
-      savedEmail.error = safeDeliveryError;
+      savedEmail.error = failure.message;
       await savedEmail.save();
     } catch (saveError) {
       return next(saveError);
     }
 
-    console.error("Email delivery failed:", error.message);
-    return res.status(502).json({
+    return res.status(failure.status).json({
       success: false,
-      message: safeDeliveryError,
+      message: failure.message,
+      error: {
+        code: failure.code,
+        responseCode: failure.responseCode,
+      },
       emailId: savedEmail.id,
     });
+  } finally {
+    if (transporter) {
+      transporter.close();
+    }
   }
 });
 
